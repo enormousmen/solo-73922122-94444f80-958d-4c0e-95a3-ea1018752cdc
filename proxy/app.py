@@ -14,24 +14,30 @@ Design notes
   their existing readers but are never re-registered; old files are unlinked
   once the last reader detaches.
 * Origin failure fails every attached download and never leaves a cached
-  half-package. Startup deletes leftover ``.part-*`` files and keeps complete
-  packages.
+  half-package. A fill is also failed when the received body does not match
+  the origin's Content-Length or X-Package-Sha256, so a package whose
+  length/digest/content disagree is never cached. Startup deletes leftover
+  ``.part-*`` files and keeps complete packages.
+* Every client response holds one reader slot; a ``finally`` around the
+  whole ASGI cycle releases it on completion, failure, or client disconnect
+  (before the first chunk or mid-body).
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 import aiohttp
 from fastapi import FastAPI
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, Response
 
 ORIGIN_BASE_URL = os.environ.get("ORIGIN_BASE_URL", "http://127.0.0.1:9000").rstrip("/")
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", "./cache")).resolve()
@@ -220,6 +226,7 @@ class Cache:
                 }
                 e.part_path.parent.mkdir(parents=True, exist_ok=True)
                 f = open(e.part_path, "wb")
+                hasher = hashlib.sha256()
                 try:
                     # Part file exists before readers are allowed to open it.
                     e.headers_known = True
@@ -227,6 +234,7 @@ class Cache:
                         e.cond.notify_all()
                     written = 0
                     async for chunk in resp.content.iter_chunked(CHUNK):
+                        hasher.update(chunk)
                         await asyncio.to_thread(f.write, chunk)
                         await asyncio.to_thread(f.flush)
                         written += len(chunk)
@@ -238,6 +246,13 @@ class Cache:
                 if e.size != -1 and written != e.size:
                     raise aiohttp.ClientPayloadError(
                         f"short read from origin: {written}/{e.size} bytes"
+                    )
+                expected = (e.meta.get("sha256") or "").strip().lower()
+                if expected and hasher.hexdigest() != expected:
+                    # Never cache a package whose digest and content disagree.
+                    raise aiohttp.ClientPayloadError(
+                        f"origin digest mismatch: sha256(body)={hasher.hexdigest()} "
+                        f"!= X-Package-Sha256={expected}"
                     )
             async with self.lock:
                 e.size = written if e.size == -1 else e.size
@@ -282,20 +297,41 @@ class Cache:
         except FileNotFoundError:
             return open(e.final_path, "rb")
 
+    @staticmethod
+    def _readable(e: Entry, offset: int) -> bool:
+        """Whether a reader at ``offset`` may consume more bytes now."""
+        if e.state != "filling":
+            return True
+        if e.written <= offset:
+            return False
+        # While the fill is live, hold back the byte range that completes a
+        # known-size package: the fill can still fail after its last byte
+        # (digest/length verification), and attached clients must observe
+        # that as a truncated response, not as a false success.
+        if e.size > 0 and e.written >= e.size and offset + CHUNK >= e.size:
+            return False
+        return True
+
     async def stream(self, e: Entry):
-        """Yield the package from byte 0, tailing the fill file if needed."""
+        """Yield the package from byte 0, tailing the fill file if needed.
+
+        Only the file handle is released here; the reader detach is owned by
+        EntryStreamResponse so it happens exactly once per response.
+        """
         offset = 0
         f = await asyncio.to_thread(self._open_current, e)
         try:
             while True:
                 async with e.cond:
-                    await e.cond.wait_for(
-                        lambda: e.written > offset or e.state != "filling"
-                    )
+                    await e.cond.wait_for(lambda: self._readable(e, offset))
+                    # Sample under the lock and never read past it: the fill
+                    # may append more (even the final bytes) between the
+                    # predicate check and the read.
+                    avail = e.written
                 if e.state == "failed":
                     raise FillFailed(e.error or "origin fill failed")
                 if e.state == "filling":
-                    limit = CHUNK
+                    limit = min(CHUNK, avail - offset)
                 else:  # complete | closed: drain exactly to the final size
                     limit = min(CHUNK, e.size - offset)
                     if limit <= 0:
@@ -303,18 +339,72 @@ class Cache:
                 data = await asyncio.to_thread(f.read, limit)
                 if not data:
                     if e.state == "filling":
-                        continue  # defensive; written>offset implies data
+                        continue  # defensive; avail>offset implies data
                     break
                 offset += len(data)
                 yield data
         finally:
-            try:
-                f.close()
-            finally:
-                await self.detach(e)
+            f.close()
 
 
 cache = Cache()
+
+
+async def _wait_disconnect(receive) -> None:
+    """Return once the ASGI server reports the client is gone."""
+    while True:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            return
+
+
+class EntryStreamResponse(Response):
+    """Streams one cache entry and detaches its reader exactly once.
+
+    The detach lives in a ``finally`` around the whole ASGI cycle, so the
+    reader slot (and, once the last reader leaves a purged/failed entry, its
+    files) is released on completion, on fill failure, and on client
+    disconnect — before the first chunk or mid-body. A disconnect watcher
+    stops the stream promptly instead of writing into a dead connection.
+    """
+
+    def __init__(self, entry: Entry, headers: dict, media_type: str) -> None:
+        self.entry = entry
+        self.status_code = 200
+        self.media_type = media_type
+        self.background = None
+        self.init_headers(headers)
+
+    async def __call__(self, scope, receive, send) -> None:
+        e = self.entry
+        try:
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": self.status_code,
+                    "headers": self.raw_headers,
+                }
+            )
+            disconnect = asyncio.ensure_future(_wait_disconnect(receive))
+            gen = cache.stream(e)
+            try:
+                async for data in gen:
+                    if disconnect.done():
+                        break  # client is gone; the finally detaches the reader
+                    await send(
+                        {"type": "http.response.body", "body": data, "more_body": True}
+                    )
+                if not disconnect.done():
+                    await send(
+                        {"type": "http.response.body", "body": b"", "more_body": False}
+                    )
+            finally:
+                await gen.aclose()
+                disconnect.cancel()
+                with suppress(asyncio.CancelledError):
+                    await disconnect
+        finally:
+            await cache.detach(e)
 
 
 def cleanup_cache_dir() -> None:
@@ -386,11 +476,15 @@ async def get_package(path: str):
     sha256 = entry.meta.get("sha256")
     if sha256:
         headers["X-Package-Sha256"] = sha256
-    return StreamingResponse(
-        cache.stream(entry),
-        media_type=entry.meta.get("content_type", "application/octet-stream"),
-        headers=headers,
-    )
+    try:
+        return EntryStreamResponse(
+            entry,
+            headers,
+            entry.meta.get("content_type", "application/octet-stream"),
+        )
+    except Exception:
+        await cache.detach(entry)
+        raise
 
 
 @app.post("/purge/{path:path}")
